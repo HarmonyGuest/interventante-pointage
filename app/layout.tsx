@@ -3,7 +3,7 @@ import "./globals.css";
 import { AuthProvider } from "@/lib/auth-context";
 
 export const metadata: Metadata = {
-  title: "Interventante — Pointage",
+  title: "SAP pro — Pointage",
   description: "Application de pointage pour intervenantes",
 };
 

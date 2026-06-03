@@ -86,7 +86,7 @@ export default function LoginPage() {
             color: "var(--text)",
             letterSpacing: "-0.5px",
           }}>
-            Harmony Team
+            SAP pro
           </h1>
           <p style={{
             color: "var(--text-muted)",

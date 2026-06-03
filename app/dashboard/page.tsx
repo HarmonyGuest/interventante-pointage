@@ -311,7 +311,7 @@ export default function Dashboard() {
                 <circle cx="12" cy="9" r="2.5" fill="white"/>
               </svg>
             </div>
-            <span style={{ fontFamily: "'Syne', sans-serif", fontWeight: 600, fontSize: 16 }}>Harmony Team</span>
+            <span style={{ fontFamily: "'Syne', sans-serif", fontWeight: 600, fontSize: 16 }}>SAP pro</span>
           </div>
           <button onClick={logout} style={{ background: "transparent", border: "none", cursor: "pointer", color: "var(--text-dim)", fontSize: 13, fontFamily: "'DM Sans', sans-serif" }}>
             Déconnexion
