@@ -143,9 +143,25 @@ export default function Dashboard() {
       const interv = USERS[user.email || ""] || "";
       const q = query(collection(db, "pointages"), where("interv", "==", interv));
       const snap = await getDocs(q);
-      const today = getToday();
-      const missions = snap.docs.map(d => ({ id: d.id, ...d.data() } as Mission)).filter(m => m.date === today);
-      const open = missions.find(m => !m.closed);
+      // ── Correctif missions de nuit ───────────────────────────────────────
+      // Avant : on ne cherchait la mission ouverte que parmi celles datées
+      // d'AUJOURD'HUI. Une mission commencée la veille (ex. arrivée 18h, départ
+      // le lendemain 8h) devenait invisible après minuit, et l'intervenante ne
+      // pouvait plus pointer son départ. Désormais on retrouve la mission
+      // ouverte la plus récente, même commencée un autre jour (fenêtre 36h).
+      const missions = snap.docs.map(
+        d => ({ id: d.id, ...d.data() } as Mission & { timestamp?: { seconds?: number } })
+      );
+      const open = missions
+        .filter(m => !m.closed)
+        .filter(m => {
+          const secs = m.timestamp?.seconds;
+          if (typeof secs === "number") {
+            return Date.now() - secs * 1000 < 36 * 60 * 60 * 1000; // moins de 36h
+          }
+          return m.date === getToday(); // repli : anciens pointages sans timestamp
+        })
+        .sort((a, b) => (b.timestamp?.seconds ?? 0) - (a.timestamp?.seconds ?? 0))[0];
       if (open) {
         setMissionId(open.id);
         setNomClient(open.nomMission);
