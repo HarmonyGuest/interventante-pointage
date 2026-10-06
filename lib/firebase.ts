@@ -1,6 +1,12 @@
 import { initializeApp, getApps, FirebaseApp } from "firebase/app";
 import { getAuth, Auth } from "firebase/auth";
-import { getFirestore, Firestore } from "firebase/firestore";
+import {
+  getFirestore,
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+  Firestore,
+} from "firebase/firestore";
 
 const firebaseConfig = {
   apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY,
@@ -16,9 +22,14 @@ let auth: Auth;
 let db: Firestore;
 
 if (typeof window !== "undefined" || process.env.NEXT_PUBLIC_FIREBASE_API_KEY) {
-  app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
+  const premiereFois = getApps().length === 0;
+  app = premiereFois ? initializeApp(firebaseConfig) : getApps()[0];
   auth = getAuth(app);
-  db = getFirestore(app);
+  // Dans le navigateur, on garde une copie locale des données : les pointages
+  // faits sans réseau restent dans le téléphone et partent au retour du réseau.
+  db = premiereFois && typeof window !== "undefined"
+    ? initializeFirestore(app, { localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }) })
+    : getFirestore(app);
 } else {
   // Placeholder for build time — will be initialized client-side
   app = {} as FirebaseApp;

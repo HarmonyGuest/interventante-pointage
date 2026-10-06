@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import { AuthProvider } from "@/lib/auth-context";
+import ServiceWorker from "./service-worker";
 
 export const metadata: Metadata = {
   title: "SAP pro — Pointage",
@@ -16,6 +17,7 @@ export default function RootLayout({
     <html lang="fr">
       <body>
         <AuthProvider>{children}</AuthProvider>
+        <ServiceWorker />
       </body>
     </html>
   );

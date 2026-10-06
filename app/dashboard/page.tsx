@@ -2,9 +2,10 @@
 
 import { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
-import { collection, addDoc, updateDoc, doc, query, where, getDocs, Timestamp } from "firebase/firestore";
+import { collection, setDoc, updateDoc, doc, query, where, getDocs, Timestamp, serverTimestamp } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
+import { synchroniserHeure, maintenant } from "@/lib/heure-serveur";
 
 interface Mission {
   id: string;
@@ -17,12 +18,13 @@ interface Mission {
   interv: string;
 }
 
+// Heure et date du serveur (voir lib/heure-serveur.ts), pas celles du téléphone
 function getNow() {
-  return new Date().toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
+  return maintenant().toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
 }
 
 function getToday() {
-  return new Date().toLocaleDateString("fr-FR");
+  return maintenant().toLocaleDateString("fr-FR");
 }
 
 function diffMinutes(t1: string, t2: string): number {
@@ -48,6 +50,25 @@ const USERS: Record<string, string> = {
   "hayet@harmony.fr": "Hayet",
 };
 
+const MISSIONS = ["Drancy", "Bobigny"];
+
+// Mission encore ouverte après 16 h = départ oublié (une mission de nuit dure ~14 h).
+const OUBLI_HEURES = 16;
+// Au-delà de 7 jours, on ne la propose plus à l'intervenante : l'admin corrige.
+const OUBLI_MAX_JOURS = 7;
+
+// Attend la confirmation du serveur quelques secondes au plus. Sans réseau,
+// l'écriture reste dans le téléphone et part toute seule au retour du réseau.
+function enregistrer(ecriture: Promise<void>): Promise<"envoye" | "en_attente"> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve("en_attente"), navigator.onLine ? 6000 : 0);
+    ecriture.then(
+      () => { clearTimeout(timer); resolve("envoye"); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
 async function tryGetPosition() {
   return new Promise<{ lat: number; lon: number; acc: number } | null>((resolve) => {
     if (typeof window === "undefined" || !navigator.geolocation) { resolve(null); return; }
@@ -64,7 +85,8 @@ async function tryGetPosition() {
 async function getAdresse(lat: number, lon: number): Promise<string> {
   try {
     const res = await fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json`, {
-      headers: { "Accept-Language": "fr" }
+      headers: { "Accept-Language": "fr" },
+      signal: AbortSignal.timeout(4000), // réseau faible : on n'attend pas l'adresse
     });
     const data = await res.json();
     const r = data.address;
@@ -107,7 +129,8 @@ async function addWatermark(file: File, prenom: string, heure: string, gps: { la
   });
 }
 
-type Etape = 1 | 2 | 3;
+// 1 = arrivée, 2 = départ, 3 = pause (anciennes missions déjà au départ pointé), 4 = départ oublié
+type Etape = 1 | 2 | 3 | 4;
 
 export default function Dashboard() {
   const { user, loading, logout } = useAuth();
@@ -120,6 +143,8 @@ export default function Dashboard() {
   const [nomClient, setNomClient] = useState("");
   const [heureArrivee, setHeureArrivee] = useState("");
   const [heureDepart_state, setHeureDepartState] = useState("");
+  const [dateMission, setDateMission] = useState("");
+  const [heureOubli, setHeureOubli] = useState("");
   const [pause, setPause] = useState("");
   const [photoArrivee, setPhotoArrivee] = useState<string | null>(null);
   const [status, setStatus] = useState<"idle" | "loading" | "success" | "error">("idle");
@@ -151,7 +176,8 @@ export default function Dashboard() {
       // d'AUJOURD'HUI. Une mission commencée la veille (ex. arrivée 18h, départ
       // le lendemain 8h) devenait invisible après minuit, et l'intervenante ne
       // pouvait plus pointer son départ. Désormais on retrouve la mission
-      // ouverte la plus récente, même commencée un autre jour (fenêtre 36h).
+      // ouverte la plus récente, même commencée un autre jour (jusqu'à 7 jours).
+      // Après 16 h, c'est un oubli : on demande l'heure réelle de départ.
       const missions = snap.docs.map(
         d => ({ id: d.id, ...d.data() } as Mission & { timestamp?: { seconds?: number } })
       );
@@ -160,16 +186,20 @@ export default function Dashboard() {
         .filter(m => {
           const secs = m.timestamp?.seconds;
           if (typeof secs === "number") {
-            return Date.now() - secs * 1000 < 36 * 60 * 60 * 1000; // moins de 36h
+            return Date.now() - secs * 1000 < OUBLI_MAX_JOURS * 24 * 60 * 60 * 1000;
           }
           return m.date === getToday(); // repli : anciens pointages sans timestamp
         })
         .sort((a, b) => (b.timestamp?.seconds ?? 0) - (a.timestamp?.seconds ?? 0))[0];
       if (open) {
+        const secs = open.timestamp?.seconds;
+        const oubli = typeof secs === "number" && Date.now() - secs * 1000 >= OUBLI_HEURES * 60 * 60 * 1000;
         setMissionId(open.id);
         setNomClient(open.nomMission);
         setHeureArrivee(open.arrive);
-        setEtape(open.depart ? 3 : 2);
+        setHeureDepartState(open.depart || "");
+        setDateMission(open.date);
+        setEtape(open.depart ? 3 : oubli ? 4 : 2);
       }
     };
     checkMission();
@@ -180,7 +210,7 @@ export default function Dashboard() {
     if (!file) return;
     setStatus("loading");
     setStatusMessage("Traitement de la photo…");
-    const gps = await tryGetPosition();
+    const [gps] = await Promise.all([tryGetPosition(), synchroniserHeure()]);
     const heure = getNow();
     const base64 = await addWatermark(file, prenom, heure, gps);
     setPhotoArrivee(base64);
@@ -210,10 +240,21 @@ export default function Dashboard() {
     setLoadingHistorique(false);
   };
 
+  const terminerMission = () => {
+    setEtape(1);
+    setNomClient("");
+    setHeureArrivee("");
+    setHeureDepartState("");
+    setDateMission("");
+    setHeureOubli("");
+    setPause("");
+    setMissionId(null);
+  };
+
   const pointerArrivee = async () => {
-    if (!user || !nomClient.trim()) {
+    if (!user || !nomClient) {
       setStatus("error");
-      setStatusMessage("Veuillez indiquer le nom du client.");
+      setStatusMessage("Choisissez la mission : Drancy ou Bobigny.");
       return;
     }
     if (!photoArrivee) {
@@ -223,11 +264,12 @@ export default function Dashboard() {
     }
     setStatus("loading");
     setStatusMessage("Enregistrement de l'arrivée…");
-    const gps = await tryGetPosition();
+    const [gps, heureVerifiee] = await Promise.all([tryGetPosition(), synchroniserHeure()]);
     const heure = getNow();
     try {
-      const docRef = await addDoc(collection(db, "pointages"), {
-        nomMission: nomClient.trim(),
+      const docRef = doc(collection(db, "pointages"));
+      const envoi = await enregistrer(setDoc(docRef, {
+        nomMission: nomClient,
         numMission: "M1",
         arrive: heure,
         depart: null,
@@ -239,14 +281,18 @@ export default function Dashboard() {
         gpsDepart: null,
         photoArrivee: photoArrivee || null,
         photoDepart: null,
-        timestamp: Timestamp.now(),
-      });
+        timestamp: Timestamp.fromDate(maintenant()),
+        // false = pointé sans réseau : heure du téléphone, non vérifiée
+        heureVerifieeArrivee: heureVerifiee,
+        recuServeurArrivee: serverTimestamp(),
+      }));
       setMissionId(docRef.id);
       setHeureArrivee(heure);
+      setDateMission(getToday());
       setPhotoArrivee(null);
       setEtape(2);
       setStatus("success");
-      setStatusMessage(`Arrivée pointée à ${heure}${gps ? " ✓ GPS" : ""}${photoArrivee ? " ✓ Photo" : ""}`);
+      setStatusMessage(`Arrivée pointée à ${heure}${gps ? " ✓ GPS" : ""} ✓ Photo${envoi === "en_attente" ? " — sans réseau : envoi au retour du réseau 📴" : ""}`);
     } catch {
       setStatus("error");
       setStatusMessage("Erreur réseau. Vérifiez votre connexion.");
@@ -255,19 +301,78 @@ export default function Dashboard() {
 
   const pointerDepart = async () => {
     if (!missionId) return;
+    if (pause === "") {
+      setStatus("error");
+      setStatusMessage("Indiquez les minutes de pause (0 si aucune).");
+      return;
+    }
     setStatus("loading");
     setStatusMessage("Enregistrement du départ…");
-    const gps = await tryGetPosition();
+    const [gps, heureVerifiee] = await Promise.all([tryGetPosition(), synchroniserHeure()]);
     const heure = getNow();
+    const pauseMins = Math.max(0, parseInt(pause) || 0);
+    const totalMinsCalc = Math.max(0, diffMinutes(heureArrivee, heure) - pauseMins);
+    const totalStr = minsToHHMM(totalMinsCalc);
     try {
-      await updateDoc(doc(db, "pointages", missionId), {
+      const envoi = await enregistrer(updateDoc(doc(db, "pointages", missionId), {
         depart: heure,
         gpsDepart: gps ? { ...gps, mapsLink: `https://maps.google.com/?q=${gps.lat},${gps.lon}` } : null,
-      });
-      setHeureDepartState(heure);
-      setEtape(3);
+        pause: pauseMins,
+        closed: true,
+        statut: "cloturee",
+        total: totalStr,
+        totalMins: totalMinsCalc,
+        timestampDepart: Timestamp.fromDate(maintenant()),
+        heureVerifieeDepart: heureVerifiee,
+        recuServeurDepart: serverTimestamp(),
+      }));
+      terminerMission();
       setStatus("success");
-      setStatusMessage(`Départ pointé à ${heure}${gps ? " ✓ GPS" : ""}`);
+      setStatusMessage(`Départ pointé à ${heure} — ${totalStr} travaillé. Bonne soirée ! 🌙${envoi === "en_attente" ? " (sans réseau : envoi au retour du réseau 📴)" : ""}`);
+    } catch {
+      setStatus("error");
+      setStatusMessage("Erreur réseau. Vérifiez votre connexion.");
+    }
+  };
+
+  const validerOubli = async () => {
+    if (!missionId) return;
+    if (!heureOubli) {
+      setStatus("error");
+      setStatusMessage("Indiquez l'heure à laquelle vous êtes partie.");
+      return;
+    }
+    if (pause === "") {
+      setStatus("error");
+      setStatusMessage("Indiquez les minutes de pause (0 si aucune).");
+      return;
+    }
+    if (diffMinutes(heureArrivee, heureOubli) > OUBLI_HEURES * 60) {
+      setStatus("error");
+      setStatusMessage(`Vérifiez l'heure de départ : cela ferait plus de ${OUBLI_HEURES} h après l'arrivée (${heureArrivee}).`);
+      return;
+    }
+    setStatus("loading");
+    setStatusMessage("Enregistrement du départ…");
+    const pauseMins = Math.max(0, parseInt(pause) || 0);
+    const totalMinsCalc = Math.max(0, diffMinutes(heureArrivee, heureOubli) - pauseMins);
+    const totalStr = minsToHHMM(totalMinsCalc);
+    try {
+      const envoi = await enregistrer(updateDoc(doc(db, "pointages", missionId), {
+        depart: heureOubli,
+        gpsDepart: null,
+        pause: pauseMins,
+        closed: true,
+        statut: "cloturee",
+        total: totalStr,
+        totalMins: totalMinsCalc,
+        // Heure indiquée après coup par l'intervenante : à vérifier par l'admin
+        departDeclare: true,
+        recuServeurDepart: serverTimestamp(),
+      }));
+      terminerMission();
+      setStatus("success");
+      setStatusMessage(`Départ du ${dateMission} enregistré à ${heureOubli} — ${totalStr}. Vous pouvez pointer votre arrivée.${envoi === "en_attente" ? " (sans réseau : envoi au retour du réseau 📴)" : ""}`);
     } catch {
       setStatus("error");
       setStatusMessage("Erreur réseau. Vérifiez votre connexion.");
@@ -287,19 +392,14 @@ export default function Dashboard() {
       const heureDepart = heureDepart_state || getNow();
       const totalMinsCalc = Math.max(0, diffMinutes(heureArrivee, heureDepart) - pauseMins);
       const totalStr = minsToHHMM(totalMinsCalc);
-      await updateDoc(doc(db, "pointages", missionId), {
+      await enregistrer(updateDoc(doc(db, "pointages", missionId), {
         pause: pauseMins,
         closed: true,
         statut: "cloturee",
         total: totalStr,
         totalMins: totalMinsCalc,
-      });
-      setEtape(1);
-      setNomClient("");
-      setHeureArrivee("");
-      setHeureDepartState("");
-      setPause("");
-      setMissionId(null);
+      }));
+      terminerMission();
       setStatus("success");
       setStatusMessage(`Journée clôturée — ${totalStr} travaillé. Bonne soirée ! 🌙`);
     } catch {
@@ -378,17 +478,19 @@ export default function Dashboard() {
         {etape === 1 && (
           <div style={{ background: "var(--surface)", borderRadius: 20, border: "1px solid var(--border)", padding: "22px 24px", marginBottom: 16 }}>
             <p style={{ fontSize: 12, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 12 }}>
-              Nom du client / Mission
+              Lieu de la mission
             </p>
-            <input
-              type="text"
-              value={nomClient}
-              onChange={e => setNomClient(e.target.value)}
-              placeholder="Ex : Mme Dupont"
-              style={{ width: "100%", background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 12, padding: "13px 16px", color: "var(--text)", fontSize: 15, outline: "none", fontFamily: "'DM Sans', sans-serif", marginBottom: 12 }}
-              onFocus={e => e.target.style.borderColor = "var(--accent)"}
-              onBlur={e => e.target.style.borderColor = "var(--border)"}
-            />
+            <div style={{ display: "flex", gap: 10, marginBottom: 12 }}>
+              {MISSIONS.map(m => (
+                <button
+                  key={m}
+                  onClick={() => setNomClient(m)}
+                  style={{ flex: 1, background: nomClient === m ? "rgba(108,99,255,0.15)" : "var(--surface2)", border: `1px solid ${nomClient === m ? "var(--accent)" : "var(--border)"}`, borderRadius: 12, padding: "14px 8px", color: nomClient === m ? "var(--text)" : "var(--text-muted)", fontSize: 15, fontWeight: 600, cursor: "pointer", fontFamily: "'DM Sans', sans-serif" }}
+                >
+                  📍 {m}
+                </button>
+              ))}
+            </div>
 
             {/* Photo arrivée optionnelle */}
             <input ref={fileInputArrivee} type="file" accept="image/*" capture="environment" onChange={handlePhotoArrivee} style={{ display: "none" }} />
@@ -428,6 +530,20 @@ export default function Dashboard() {
                 <p style={{ fontSize: 12, color: "var(--text-muted)" }}>Mission démarrée à {heureArrivee}</p>
               </div>
             </div>
+            <p style={{ fontSize: 12, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 10 }}>
+              Temps de pause (en minutes)
+            </p>
+            <input
+              type="number"
+              inputMode="numeric"
+              value={pause}
+              onChange={e => setPause(e.target.value)}
+              placeholder="0"
+              min="0"
+              style={{ width: "100%", background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 12, padding: "13px 16px", color: "var(--text)", fontSize: 15, outline: "none", fontFamily: "'DM Sans', sans-serif", marginBottom: 14 }}
+              onFocus={e => e.target.style.borderColor = "var(--accent)"}
+              onBlur={e => e.target.style.borderColor = "var(--border)"}
+            />
             <button
               onClick={pointerDepart}
               disabled={status === "loading"}
@@ -476,6 +592,50 @@ export default function Dashboard() {
                 <path d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
               </svg>
               Clôturer la journée
+            </button>
+          </div>
+        )}
+
+        {/* ÉTAPE 4 — départ oublié */}
+        {etape === 4 && (
+          <div style={{ background: "var(--surface)", borderRadius: 20, border: "1px solid rgba(255,92,108,0.4)", padding: "22px 24px", marginBottom: 16 }}>
+            <div style={{ marginBottom: 20, padding: "12px 16px", background: "rgba(255,92,108,0.08)", borderRadius: 12 }}>
+              <p style={{ fontSize: 14, fontWeight: 600, color: "var(--danger)", marginBottom: 4 }}>⚠️ Départ non pointé</p>
+              <p style={{ fontSize: 13, color: "var(--text-muted)" }}>
+                Mission {nomClient} du {dateMission}, arrivée à {heureArrivee}. Indiquez l&apos;heure à laquelle vous êtes partie.
+              </p>
+            </div>
+            <p style={{ fontSize: 12, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 10 }}>
+              Heure de départ
+            </p>
+            <input
+              type="time"
+              value={heureOubli}
+              onChange={e => setHeureOubli(e.target.value)}
+              style={{ width: "100%", background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 12, padding: "13px 16px", color: "var(--text)", fontSize: 15, outline: "none", fontFamily: "'DM Sans', sans-serif", marginBottom: 14, colorScheme: "dark" }}
+              onFocus={e => e.target.style.borderColor = "var(--accent)"}
+              onBlur={e => e.target.style.borderColor = "var(--border)"}
+            />
+            <p style={{ fontSize: 12, color: "var(--text-muted)", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 10 }}>
+              Temps de pause (en minutes)
+            </p>
+            <input
+              type="number"
+              inputMode="numeric"
+              value={pause}
+              onChange={e => setPause(e.target.value)}
+              placeholder="0"
+              min="0"
+              style={{ width: "100%", background: "var(--surface2)", border: "1px solid var(--border)", borderRadius: 12, padding: "13px 16px", color: "var(--text)", fontSize: 15, outline: "none", fontFamily: "'DM Sans', sans-serif", marginBottom: 14 }}
+              onFocus={e => e.target.style.borderColor = "var(--accent)"}
+              onBlur={e => e.target.style.borderColor = "var(--border)"}
+            />
+            <button
+              onClick={validerOubli}
+              disabled={status === "loading"}
+              style={{ width: "100%", background: "linear-gradient(135deg, #7c3aed, var(--accent))", border: "none", borderRadius: 14, padding: "15px", color: "white", fontSize: 15, fontWeight: 600, cursor: "pointer", fontFamily: "'DM Sans', sans-serif", boxShadow: "0 8px 24px var(--accent-glow)" }}
+            >
+              Valider mon départ
             </button>
           </div>
         )}
