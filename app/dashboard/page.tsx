@@ -44,6 +44,8 @@ const USERS: Record<string, string> = {
   "djedjiga@harmony.fr": "Djedjiga",
   "siham@harmony.fr": "Siham",
   "lilia@harmony.fr": "Lilia",
+  "diougouna@harmony.fr": "Diougouna",
+  "hayet@harmony.fr": "Hayet",
 };
 
 async function tryGetPosition() {
