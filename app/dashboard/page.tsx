@@ -40,7 +40,7 @@ function minsToHHMM(m: number): string {
 }
 
 const USERS: Record<string, string> = {
-  "drouche@harmony.fr": "Drouche Zedjiga",
+  "drouche@harmony.fr": "Drouche zedjiga",
   "djedjiga@harmony.fr": "Djedjiga",
   "siham@harmony.fr": "Siham",
   "lilia@harmony.fr": "Lilia",
